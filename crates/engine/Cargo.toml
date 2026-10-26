@@ -43,11 +43,14 @@ lightcraft-segment = { workspace = true, optional = true }
 lightcraft-fetch = { workspace = true }
 
 [features]
+heif = ["lightcraft-codecs/heif"]
 # AI masks with SAM 3 (Object / Describe). Off for the web and CLI builds.
 sam = ["dep:lightcraft-segment"]
 denoise = ["dep:lightcraft-denoise", "lightcraft-denoise/runtime", "lightcraft-gpu/denoise"]
 rawnind-model = ["denoise", "lightcraft-denoise/rawnind-model", "lightcraft-denoise-core/rawnind-model"]
 
 [dev-dependencies]
+# Lossless synthetic HEIC files (the import test; decoded when the codecs' `heif` feature is on).
+lightcraft-heif = { workspace = true, features = ["testdata"] }
 libc = { workspace = true }
 lightcraft-tiff = { workspace = true }

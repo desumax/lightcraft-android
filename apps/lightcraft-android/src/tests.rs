@@ -13,6 +13,40 @@ fn first_photo(s: &MobileSession) -> u64 {
     photos[0].id
 }
 
+#[test]
+fn processing_upgrade_keeps_edits_and_is_undoable() {
+    let s = MobileSession::demo();
+    s.open_photo(first_photo(&s)).unwrap();
+    s.execute("develop.merge".into(), r#"{"settings":{"process":1,"light":{"shadows":42}}}"#.into()).unwrap();
+    assert!(s.develop_state().unwrap().older_process);
+    s.execute("develop.updateProcess".into(), "{}".into()).unwrap();
+    assert!(!s.develop_state().unwrap().older_process);
+    assert_eq!(control(&s, "light.shadows").value, 42.0);
+    s.undo().unwrap();
+    assert!(s.develop_state().unwrap().older_process);
+    assert_eq!(control(&s, "light.shadows").value, 42.0);
+}
+
+#[test]
+fn heic_imports_renders_and_exports_through_the_mobile_bridge() {
+    use lightcraft_heif::testdata::{Spec, build};
+    let dir = temp_dir("heic");
+    let file = dir.join("phone.heic");
+    let pixels = |x: u32, y: u32| [((x + y) % 100 + 50) as u16, 110, 150];
+    std::fs::write(&file, build(&Spec::new(96, 64, &pixels))).unwrap();
+    let s = MobileSession::open(dir.join("library").to_string_lossy().into_owned(), false).unwrap();
+    let report = s.import(vec![file.to_string_lossy().into_owned()], false, false).unwrap();
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(report.imported.len(), 1);
+    let id = report.imported[0];
+    s.open_photo(id).unwrap();
+    assert!(s.develop_state().unwrap().preview_only.is_none());
+    assert!(s.render_thumbnail(id, 128).is_ok());
+    assert!(!s.export(id, r#"{"format":"jpeg","longEdge":96}"#.into()).unwrap().bytes.is_empty());
+    drop(s);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn control(s: &MobileSession, id: &str) -> DevelopControl {
     s.develop_controls().into_iter().find(|c| c.id == id).unwrap()
 }

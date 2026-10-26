@@ -47,7 +47,7 @@ CRW, MRW, X3F) are detected so the engine can route them to `lightcraft-raw`; `d
 | PSD / PSB | merged composite: 8/16/32-bit gray, RGB, CMYK, indexed, duotone (as gray); raw/RLE | — | ICC (1039), EXIF (1058), XMP (1060); ZIP-compressed composite, Lab and 1-bit unsupported |
 | JPEG XL | yes (jxl-oxide, feature `jxl`, default on) | — | enum colour → rendered straight to linear Rec.2020; ICC → our ICC path; orientation applied by the decoder (reported as 1) |
 | AVIF | **no** | yes (ravif/rav1e, native only, feature `avif`) | 8-bit sRGB, EXIF; no ICC in the muxer |
-| HEIC/HEIF | **no** (sniff only) | — | see gaps |
+| HEIC/HEIF | yes with feature `heif` (lightcraft-heif: heic-rs + libheif-matching colour; 4:2:0/mono, 8–10-bit, grids, irot/imir/clap, ICC/nclx/VUI, EXIF/XMP, thumbnail item) | — | 4:2:2/4:4:4 (Canon/Sony HIF) unsupported |
 
 ## Colour
 
@@ -100,9 +100,11 @@ Run `cargo test --release -p lightcraft-codecs --test bench -- --ignored --nocap
 
 ## Gaps / limitations
 
-- **AVIF and HEIC decode**: no permissively licensed, pure-Rust AV1/HEVC decoder exists today
-  (dav1d/libheif are C; rav1d-safe and imazen's heic are AGPL). Files are sniffed and rejected with
-  `Error::Unsupported`; a raw-style embedded-preview path could be added for HEIC thumbnails.
+- **AVIF decode**: no permissively licensed, pure-Rust AV1 decoder exists today (dav1d is C;
+  rav1d-safe is AGPL). Files are sniffed and rejected with `Error::Unsupported`.
+- **HEIC** needs the `heif` feature (off by default: HEVC patents are the distributor's call);
+  without it, `Error::Unsupported` says the build has no HEIC support. 4:2:2 and 4:4:4 HEIF
+  (Canon/Sony HIF) is refused: heic-rs 0.1.1 loses sync on those bitstreams.
 - JPEG: arithmetic coding unsupported (as in both decoders); extended XMP (> 64 KiB) neither read
   nor written; EXIF > 64 KiB not written. The encoder uses standard Huffman tables (interleaved
   baseline) for maximum compatibility.

@@ -44,3 +44,5 @@ avif = ["dep:ravif"]
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Lossless synthetic HEIC files for the `heif` feature's tests.
+lightcraft-heif = { workspace = true, features = ["testdata"] }

@@ -84,6 +84,11 @@ pub struct SourceInfo {
     pub camera_tone: Option<tone::CameraTone>,
     /// Segmentation mattes stored in the file (DNG semantic masks): AI masks use them.
     pub mattes: Option<Arc<masks::Mattes>>,
+    /// Long edge (px) of the original photo, when the source handed to the renderer is a smaller
+    /// copy of it (the app's thumbnail and preview levels); `None`: the source is the original.
+    /// Noise reduction sizes its radii in the original's pixels ([`Plan::detail_scale`]), so a
+    /// preview looks like the full-size render scaled down (issue #960).
+    pub native_long: Option<usize>,
 }
 
 impl Default for SourceInfo {
@@ -97,6 +102,7 @@ impl Default for SourceInfo {
             camera_color: None,
             camera_tone: None,
             mattes: None,
+            native_long: None,
         }
     }
 }
@@ -346,6 +352,9 @@ pub struct Plan<'a> {
     pub px_per_long: f64,
     /// Long edge of the source buffer (px).
     pub src_long: usize,
+    /// Output pixels per pixel of the original photo ([`SourceInfo::native_long`], else the source
+    /// buffer), at most 1: the scale of noise reduction, whose radii are in the original's pixels.
+    pub detail_scale: f32,
     /// Key of the resampled source (together with the source buffer's identity).
     pub geo: u64,
     /// Key of the white-balanced, retouched, denoised image (and of the planes computed from it).
@@ -416,6 +425,9 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         None => (frame, full_w, full_h),
     };
     let src_long = src.width.max(src.height);
+    // (an original reported smaller than the source is the source)
+    let native_long = info.native_long.unwrap_or(0).max(src_long).max(1);
+    let detail_scale = local::detail_scale(px_per_long, native_long);
     let geo = hash_of((format!("{frame:?}"), w, h));
     let (wb_t, wb_tint) = local::effective_wb(info, s);
     let eyes = redeye::resolve(src, &s.red_eye, s.orientation, &frame, w, h, px_per_long);
@@ -429,8 +441,9 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         format!("{:?}", s.optics),
         [d.nr_luminance, d.nr_detail, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits),
         src_long,
+        detail_scale.to_bits(),
     ));
-    Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, eyes, fixed_air, keep, mattes: info.mattes.clone() }
+    Plan { settings, frame, w, h, px_per_long, src_long, detail_scale, geo, lin_key, eyes, fixed_air, keep, mattes: info.mattes.clone() }
 }
 
 /// The last few [`luminance_ranks`] tables, by source and white balance.
@@ -510,7 +523,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         Src::Shared(a) => a,
     };
     let plan = plan(src_img, info, s, req);
-    let Plan { ref frame, w, h, px_per_long, src_long, geo, lin_key, .. } = plan;
+    let Plan { ref frame, w, h, px_per_long, detail_scale, geo, lin_key, .. } = plan;
     let s = &*plan.settings;
 
     let shared = match (&src, cache) {
@@ -530,7 +543,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
             // Without a cache the resampled buffer is ours: work on it in place.
             let mut img = if shared.is_some() { (*sampled).clone() } else { Arc::unwrap_or_clone(sampled.clone()) };
             lin_cpu(&mut img, info, &plan);
-            local::denoise(&mut img, s, src_long, frame.output_long(w, h));
+            local::denoise(&mut img, s, detail_scale);
             Arc::new(img)
         }
     };
@@ -692,9 +705,9 @@ fn overlay_alpha(o: Overlay, plan: &Plan<'_>, prep: &Prepared) -> Option<Plane> 
 }
 
 /// Convenience: render a before/after pair side by side is up to the UI; this renders "before"
-/// (default look, keeping the crop so framing matches).
+/// (default look, keeping the crop so framing matches, under the photo's own rendering process).
 pub fn before_settings(s: &DevelopSettings) -> DevelopSettings {
-    let mut b = DevelopSettings { crop: s.crop, orientation: s.orientation, ..DevelopSettings::default() };
+    let mut b = DevelopSettings { crop: s.crop, orientation: s.orientation, process: s.process, ..DevelopSettings::default() };
     b.wb = lightcraft_develop::WhiteBalance { mode: lightcraft_develop::WbMode::AsShot, ..b.wb };
     b
 }
@@ -730,5 +743,9 @@ mod tests;
 mod tests_geometry;
 #[cfg(test)]
 mod tests_local;
+#[cfg(test)]
+mod tests_nr_scale;
+#[cfg(test)]
+mod tests_tone;
 #[cfg(test)]
 mod tests_window;

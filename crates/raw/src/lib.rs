@@ -20,7 +20,8 @@
 //! [`embedded_preview`] covers these containers' JPEG previews. Variants we can't decode yet (Nikon "lossy after split" NEF,
 //! compressed ORF, CR3 unverified marker families / C-RAW configurations) return [`RawError::Unsupported`]; each vendor module documents its sources
 //! (public specifications, tag-name documentation, black-box analysis of CC0 samples) and gaps. Non-DNG files carry no
-//! colour matrix: [`color`] falls back to a documented neutral model. The decoders never panic on malformed input.
+//! colour matrix: [`spectral`] has matrices fitted to measured spectral sensitivities for 52 models, and
+//! otherwise [`color`] falls back to a documented neutral model. The decoders never panic on malformed input.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -38,6 +39,7 @@ pub mod opcodes;
 mod preview;
 pub mod profile;
 pub mod semantic;
+pub mod spectral;
 mod tiffraw;
 mod unpack;
 mod vendor;
@@ -49,7 +51,10 @@ pub use lightcraft_geom::Orientation;
 pub use lightcraft_meta::Metadata;
 pub use lightcraft_raster::Rgb32f;
 pub use opcodes::{Opcode, OpcodeLists};
-pub use preview::{PreviewColorSpace, embedded_preview, embedded_preview_color_space};
+pub use preview::{
+    PREVIEW_PREFIX, PreviewColorSpace, PreviewRange, bounded_preview, embedded_preview, embedded_preview_color_space, embedded_preview_covering,
+    embedded_preview_from_range,
+};
 pub use semantic::{SemanticMask, semantic_masks};
 
 use lightcraft_color::Xy;
@@ -268,6 +273,17 @@ fn other_tiff_reason(bytes: &[u8]) -> String {
 /// Decode a raw file.
 pub fn decode(bytes: &[u8]) -> Result<RawImage> {
     decode_with(bytes, Mode::Full)
+}
+
+/// [`decode`] at a smaller size, for a picture whose default crop needs a long edge of only `min_long` px: a DNG
+/// that keeps reduced-resolution copies of its LinearRaw image (Lightroom's HDR and panorama merges keep 256 to 2048
+/// px ones) decodes the smallest that covers it. The image has the full one's levels, colour and metadata; its
+/// active area and crop are scaled to its size. `Ok(None)` when the file keeps no such copy: decode it whole.
+pub fn decode_reduced(bytes: &[u8], min_long: usize) -> Result<Option<RawImage>> {
+    if probe(bytes) != Some(RawFormat::Dng) {
+        return Ok(None);
+    }
+    dng::decode_reduced(bytes, min_long)
 }
 
 /// Everything [`decode`] learns about a raw file except its samples: geometry, orientation, CFA,
@@ -909,6 +925,93 @@ mod tests {
         // no pointer and no sub-IFDs: just a broken TIFF
         let g = write(&[IfdBuilder::new().with(t::MAKE, Value::Ascii("KODAK".into()))]);
         assert_eq!(probe(&g), None);
+    }
+
+    /// A LinearRaw DNG in the layout of Lightroom's merges: a `w` × `h` main image (samples 1000) with a default
+    /// crop, and reduced copies (samples 2000 + their width) of the given sizes beside it.
+    fn linear_dng_with_copies(w: u32, h: u32, copies: &[(u32, u32)], main_tags: &[(u16, Value)]) -> Vec<u8> {
+        linear_dng_with_copy_tags(w, h, copies, main_tags, &[])
+    }
+
+    fn linear_dng_with_copy_tags(w: u32, h: u32, copies: &[(u32, u32)], main_tags: &[(u16, Value)], copy_tags: &[(u16, Value)]) -> Vec<u8> {
+        let linear = |subfile: u32, w: u32, h: u32, sample: u16| {
+            let mut ifd = IfdBuilder::new();
+            ifd.set(t::NEW_SUBFILE_TYPE, Value::Long(vec![subfile]));
+            ifd.set(t::IMAGE_WIDTH, Value::Long(vec![w]));
+            ifd.set(t::IMAGE_LENGTH, Value::Long(vec![h]));
+            ifd.set(t::BITS_PER_SAMPLE, Value::Short(vec![16, 16, 16]));
+            ifd.set(t::SAMPLES_PER_PIXEL, Value::Short(vec![3]));
+            ifd.set(t::PHOTOMETRIC, Value::Short(vec![t::photometric::LINEAR_RAW]));
+            ifd.set(t::COMPRESSION, Value::Short(vec![1]));
+            ifd.set(t::WHITE_LEVEL, Value::Long(vec![32768]));
+            let samples: Vec<u8> = std::iter::repeat_n(sample.to_le_bytes(), (w * h * 3) as usize).flatten().collect();
+            ifd.set_image(ImageData::Strips { rows_per_strip: h, strips: vec![samples] });
+            ifd
+        };
+        let mut main = linear(0, w, h, 1000);
+        main.set(t::BLACK_LEVEL, Value::Short(vec![100]));
+        main.set(t::DEFAULT_CROP_ORIGIN, Value::Long(vec![4, 2]));
+        main.set(t::DEFAULT_CROP_SIZE, Value::Long(vec![w - 8, h - 4]));
+        for (tag, v) in main_tags {
+            main.set(*tag, v.clone());
+        }
+        let mut ifd0 = rgb_ifd(4, 2);
+        ifd0.set(t::NEW_SUBFILE_TYPE, Value::Long(vec![1]));
+        ifd0.set(t::DNG_VERSION, Value::Byte(vec![1, 7, 0, 0]));
+        ifd0.set(t::MAKE, Value::Ascii("DJI".into()));
+        ifd0.set(t::COLOR_MATRIX_1, Value::SRational(vec![(1, 1), (0, 1), (0, 1), (0, 1), (1, 1), (0, 1), (0, 1), (0, 1), (1, 1)]));
+        ifd0.add_sub_ifd(main);
+        for &(cw, ch) in copies {
+            let mut copy = linear(1, cw, ch, 2000 + cw as u16);
+            for (tag, v) in copy_tags {
+                copy.set(*tag, v.clone());
+            }
+            ifd0.add_sub_ifd(copy);
+        }
+        write(&[ifd0])
+    }
+
+    /// A thumbnail of a Lightroom merge decodes the smallest reduced copy of its raw image that covers it, with the
+    /// main image's levels and its crop scaled; nothing covers it, or the main image has full-size opcodes: `None`.
+    #[test]
+    fn reduced_copies_of_a_linear_raw_dng_decode_at_their_size() {
+        let file = linear_dng_with_copies(64, 32, &[(32, 16), (16, 8)], &[]);
+        let full = decode(&file).unwrap();
+        assert_eq!((full.width, full.height, full.crop), (64, 32, Rect::new(4, 2, 56, 28)));
+        // a 12 px picture: the 16 px copy (its crop is 14 px long)
+        let small = decode_reduced(&file, 12).unwrap().expect("a copy covers 12 px");
+        assert_eq!((small.width, small.height), (16, 8));
+        assert_eq!(small.crop, Rect::new(1, 1, 14, 7));
+        let RawData::U16(v) = &small.data else { panic!("16-bit samples") };
+        assert!(v.iter().all(|&s| s == 2016), "the 16 px copy's samples");
+        assert_eq!((small.white.clone(), small.black.values.clone()), (vec![32768.0], vec![100.0]), "its own white, the main black");
+        assert_eq!((small.metadata.width, small.metadata.height), (Some(56), Some(28)), "the developed size is the photo's");
+        // 20 px: the 32 px copy (28 px); 40 px: none covers it
+        assert_eq!(decode_reduced(&file, 20).unwrap().map(|r| r.width), Some(32));
+        assert!(decode_reduced(&file, 40).unwrap().is_none());
+        // a different aspect ratio is not a copy of the image
+        assert!(decode_reduced(&linear_dng_with_copies(64, 32, &[(16, 16)], &[]), 8).unwrap().is_none());
+        // opcodes are in full-size pixels
+        let opcodes = linear_dng_with_copies(64, 32, &[(16, 8)], &[(t::OPCODE_LIST_3, Value::Undefined(vec![0, 0, 0, 0]))]);
+        assert!(decode_reduced(&opcodes, 8).unwrap().is_none());
+        // not a DNG
+        assert!(decode_reduced(&write(&[rgb_ifd(16, 8)]), 8).unwrap().is_none());
+    }
+
+    #[test]
+    fn reduced_dng_copies_with_unsupported_layout_or_corrections_fall_back() {
+        for (tag, value) in [
+            (50975, Value::Long(vec![2])), // RowInterleaveFactor, DNG 1.7
+            (52547, Value::Long(vec![2])), // ColumnInterleaveFactor
+            (t::OPCODE_LIST_3, Value::Undefined(vec![0, 0, 0, 0])),
+            (t::BLACK_LEVEL_DELTA_H, Value::Rational(vec![(1, 1); 16])),
+        ] {
+            let file = linear_dng_with_copy_tags(64, 32, &[(16, 8)], &[], &[(tag, value)]);
+            assert!(decode_reduced(&file, 8).unwrap().is_none(), "unsafe copy tag {tag}");
+            assert_eq!(decode(&file).unwrap().width, 64, "the main image still opens");
+        }
+        let file = linear_dng_with_copy_tags(64, 32, &[(16, 8)], &[], &[(50975, Value::Long(vec![1]))]);
+        assert_eq!(decode_reduced(&file, 8).unwrap().unwrap().width, 16);
     }
 
     /// Compression 99 (not a registered TIFF value; Leaf MOS tiles) marks a raw even without a CFA tag.

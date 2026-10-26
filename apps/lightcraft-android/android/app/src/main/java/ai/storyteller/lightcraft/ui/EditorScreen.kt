@@ -844,6 +844,18 @@ private fun UndoButton(vm: AppViewModel, ed: EditorState) {
                         LcIcon(LcIcon.Undo, null, tint = Lc.menuIcon, size = 22.dp)
                         Text("Reset", color = Lc.menuText, fontFamily = Inter, fontSize = 17.sp, modifier = Modifier.padding(start = 10.dp))
                     }
+                    if (ed.state?.olderProcess == true) {
+                        Row(
+                            Modifier.fillMaxWidth().height(40.dp).clickable(role = Role.Button) {
+                                open = false
+                                vm.updateProcessing()
+                            }.padding(horizontal = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            LcIcon(LcIcon.Undo, null, tint = Lc.menuIcon, size = 22.dp)
+                            Text("Improve highlight/shadow detail", color = Lc.menuText, fontFamily = Inter, fontSize = 17.sp, modifier = Modifier.padding(start = 10.dp))
+                        }
+                    }
                     // the open tool's own reset
                     val toolReset = when {
                         ed.tool == MainTool.CROP && ed.cropTab == "geometry" -> "Reset Geometry" to { vm.resetSectionNamed("geometry") }

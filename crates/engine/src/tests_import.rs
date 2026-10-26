@@ -1128,3 +1128,39 @@ fn folder_import_picks_up_undecodable_raw_containers_as_preview_only() {
     assert!(s.catalog.photos().all(|p| p.preview_only.is_some() && p.kind == lightcraft_catalog::MediaKind::Raw && (p.width, p.height) == (40, 30)));
     let _ = std::fs::remove_dir_all(&src);
 }
+/// A HEIC laid out like an iPhone's (a grid of HEVC pictures, a Display P3 profile, a quarter turn
+/// in the container, a thumbnail) imports as a normal photo that develops and exports upright like
+/// a JPEG. In a build without the codecs' `heif` feature it is reported as failed, saying why.
+#[test]
+fn heic_imports_as_a_normal_photo_or_says_why_not() {
+    use lightcraft_heif::testdata::{Prop, Spec, build};
+    let src = temp_dir("heic");
+    let photo = |x: u32, y: u32| [((x * 7 + y * 13) % 200 + 30) as u16, 110, 150];
+    let p3 = lightcraft_codecs::icc::write_named(lightcraft_codecs::NamedSpace::DisplayP3);
+    let bytes = build(&Spec { props: vec![Prop::Icc(p3), Prop::Irot(1)], thumbnail: Some(&photo), ..Spec::new(96, 64, &photo) });
+    std::fs::write(src.join("IMG_0001.HEIC"), &bytes).unwrap();
+    let mut s = Session::new().with_fs();
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    if !lightcraft_codecs::Format::Heif.can_decode() {
+        assert_eq!((ids(&r, "imported"), ids(&r, "failed")), (0, 1), "{r}");
+        assert!(r["failed"].to_string().contains("isn't included in this build"), "{r}");
+        let _ = std::fs::remove_dir_all(&src);
+        return;
+    }
+    assert_eq!((ids(&r, "imported"), ids(&r, "failed")), (1, 0), "{r}");
+    let p = s.catalog.photos().next().unwrap();
+    let id = p.id;
+    // Upright (the container's turn applied) and not preview-only.
+    assert_eq!((p.kind, p.preview_only.clone(), p.width, p.height), (lightcraft_catalog::MediaKind::Image, None, 64, 96));
+    s.execute("library.select", &json!({"ids": [id.0], "active": id.0})).unwrap();
+    let plain = crate::export::export_photo(&mut s, id, &crate::export::ExportOptions::from_json(&json!({"format": "png"})), 1).unwrap();
+    assert_eq!((plain.width, plain.height), (64, 96));
+    s.execute("develop.set", &json!({"control": "light.exposure", "value": 1.0})).unwrap();
+    let brighter = crate::export::export_photo(&mut s, id, &crate::export::ExportOptions::from_json(&json!({"format": "png"})), 1).unwrap();
+    let mean = |png: &[u8]| {
+        let d = lightcraft_codecs::decode(png, Default::default()).unwrap();
+        d.image.data.iter().map(|p| p[1]).sum::<f32>() / d.image.data.len() as f32
+    };
+    assert!(mean(&brighter.bytes) > mean(&plain.bytes) * 1.3, "exposure +1 brightens the HEIC");
+    let _ = std::fs::remove_dir_all(&src);
+}

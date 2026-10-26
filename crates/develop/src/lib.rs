@@ -56,11 +56,13 @@ impl DevelopSettings {
         h
     }
 
-    /// True if nothing differs from a fresh default (ignoring white balance "as shot" values).
+    /// True if nothing differs from a fresh default (ignoring white balance "as shot" values, and
+    /// the rendering process: that is not an edit).
     pub fn is_unedited(&self) -> bool {
         let mut a = self.clone();
         let d = DevelopSettings::default();
         a.wb = d.wb;
+        a.process = d.process;
         a == d
     }
 
@@ -129,6 +131,9 @@ impl DevelopSettings {
         self.masks.iter().map(|m| m.id).max().map_or(1, |m| m + 1)
     }
 }
+
+#[cfg(test)]
+mod tests_process;
 
 #[cfg(test)]
 mod tests {

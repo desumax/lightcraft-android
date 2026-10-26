@@ -4,7 +4,7 @@
 //! A global matrix can't follow the camera's hue-dependent rendering (the best matrix rendered a
 //! lime shirt olive that the camera kept lime): a hue/saturation table fitted to the residuals
 //! (applied like a DNG `ProfileHueSatMap`) corrects that when it also improves the held-out pixels.
-use lightcraft_color::{D50, D65, Mat3, PROPHOTO, REC2020, bradford, luminance_2020};
+use lightcraft_color::{D50, D65, Mat3, PROPHOTO, REC2020, Xy, bradford, luminance_2020};
 use lightcraft_pipeline::tone::{CameraTone, ToneMap};
 use lightcraft_raster::{
     Rgb32f,
@@ -37,6 +37,43 @@ pub(crate) fn file_local_look(format: RawFormat) -> bool {
     )
 }
 
+/// The colour a raw starts from, first available first: the file's own colour matrices (DNG); a look fitted to the
+/// file's JPEG ([`fit_preview`]: with the camera profile for its model when there is one, else with colour fitted to
+/// this photo alone); the model's colour matrices from measured spectral sensitivities (`lightcraft_raw::spectral`);
+/// the neutral fallback. The spectral matrices only stand in for the neutral fallback, so a photo whose JPEG fit is
+/// accepted renders as without them; when used they are written into `raw.color`. Returns the as-shot white, the
+/// camera transform at it and the fitted look.
+pub(crate) fn starting_colour(raw: &mut RawImage, bytes: &[u8]) -> (Xy, CameraTransform, Option<CameraLook>) {
+    starting_colour_with(raw, |raw, t| fit_preview(raw, bytes, t))
+}
+
+/// [`starting_colour`] with the JPEG fit passed in (tests pin the order with it).
+fn starting_colour_with(
+    raw: &mut RawImage,
+    fit: impl FnOnce(&RawImage, &CameraTransform) -> Option<CameraLook>,
+) -> (Xy, CameraTransform, Option<CameraLook>) {
+    let start = |raw: &RawImage| {
+        let xy = lightcraft_raw::color::as_shot_white_xy(raw);
+        (xy, lightcraft_raw::color::camera_transform(raw, xy))
+    };
+    let (xy, t) = start(raw);
+    if !t.matrix_is_fallback {
+        return (xy, t, None);
+    }
+    if let Some(look) = fit(raw, &t) {
+        return (xy, t, Some(look));
+    }
+    let Some(camera) = raw.metadata.model.as_deref().and_then(|model| lightcraft_raw::spectral::find(raw.metadata.make.as_deref(), model)) else {
+        return (xy, t, None);
+    };
+    camera.fill(&mut raw.color);
+    if lightcraft_pipeline::profiling() {
+        eprintln!("[profile] {:?} camera colour from spectral sensitivities: {} {}", raw.format, camera.make, camera.model);
+    }
+    let (xy, t) = start(raw);
+    (xy, t, None)
+}
+
 pub(crate) fn fit_preview(raw: &RawImage, bytes: &[u8], transform: &CameraTransform) -> Option<CameraLook> {
     if !transform.matrix_is_fallback || !file_local_look(raw.format) {
         return None;
@@ -64,7 +101,7 @@ pub(crate) fn fit_preview(raw: &RawImage, bytes: &[u8], transform: &CameraTransf
 /// matrix: the generic camera ≈ sRGB model) and of the file's embedded camera JPEG (linear Rec.2020).
 fn proxies(raw: &RawImage, bytes: &[u8], transform: &CameraTransform, size: usize) -> Option<(Rgb32f, Rgb32f)> {
     let edge = (2 * size).max(384) as u32;
-    let decoded = crate::files::decode_raw_preview(bytes, lightcraft_codecs::DecodeOptions { max_size: Some((edge, edge)), max_pixels: 64_000_000 })?;
+    let decoded = crate::files::decode_raw_preview(bytes, lightcraft_codecs::DecodeOptions { max_size: Some((edge, edge)), max_pixels: 64_000_000 }, None)?;
     let mut reference = decoded.to_working();
     let (a, crop) = (raw.active_area, raw.crop.clipped(raw.active_area.width, raw.active_area.height));
     if crop.width == 0 || crop.height == 0 || reference.width == 0 || reference.height == 0 {
@@ -485,6 +522,20 @@ fn to_prophoto() -> Mat3 {
     PROPHOTO.from_xyz().mul(&bradford(D65, D50)).mul(&REC2020.to_xyz())
 }
 
+/// its colour; in between the two are blended, so noisy shadows show no step.
+const MIN_LUMINANCE_KEPT: f32 = 0.25;
+const NO_LUMINANCE_KEPT: f32 = 0.15;
+
+/// How much of the table's colour a pixel gets when the table kept `share` of its luminance: 0 up to
+/// [`NO_LUMINANCE_KEPT`], 1 from [`MIN_LUMINANCE_KEPT`], a smoothstep between.
+fn restore_weight(share: f32) -> f32 {
+    if !share.is_finite() {
+        return 0.0;
+    }
+    let t = ((share - NO_LUMINANCE_KEPT) / (MIN_LUMINANCE_KEPT - NO_LUMINANCE_KEPT)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// A fitted [`CameraLook::hue_sat`] table, ready to apply to linear Rec.2020 pixels. It changes
 /// hue and saturation only: luminance is restored, the camera tone curve owns it.
 pub(crate) struct HueSat<'a> {
@@ -504,7 +555,55 @@ impl<'a> HueSat<'a> {
         let mul = |m: &[[f32; 3]; 3], v: [f32; 3]| -> [f32; 3] { std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2]) };
         let out = mul(&self.from, self.table.apply(mul(&self.to, rgb)));
         let (before, after) = (luminance_2020(rgb), luminance_2020(out));
-        if before > 0.0 && after > 0.0 && out.iter().all(|v| v.is_finite()) { out.map(|v| v * before / after) } else { rgb }
+        // restoring the luminance divides by the table's: near black, where noise makes some channels
+        // negative, the table can bring it close to 0, and the gain would turn the pixel white (#820)
+        if before <= 0.0 || after <= 0.0 || !out.iter().all(|v| v.is_finite()) {
+            return rgb;
+        }
+        let w = restore_weight(after / before);
+        if w >= 1.0 {
+            return out.map(|v| v * before / after);
+        }
+        if w <= 0.0 {
+            return rgb;
+        }
+        std::array::from_fn(|i| rgb[i] + (out[i] * before / after - rgb[i]) * w)
+    }
+
+    /// [`Self::apply`] to `N` pixels at once (`rgb[channel][lane]`), bit for bit, through
+    /// [`HsvTable::apply_lanes`], with the guards as selects.
+    #[inline]
+    pub fn apply_lanes<const N: usize>(&self, rgb: [[f32; N]; 3]) -> [[f32; N]; 3] {
+        let mul = |m: &[[f32; 3]; 3], v: &[[f32; N]; 3]| {
+            let mut out = [[0.0f32; N]; 3];
+            for (row, out) in m.iter().zip(&mut out) {
+                for l in 0..N {
+                    out[l] = row[0] * v[0][l] + row[1] * v[1][l] + row[2] * v[2][l];
+                }
+            }
+            out
+        };
+        let out = mul(&self.from, &self.table.apply_lanes(mul(&self.to, &rgb)));
+        let mut restored = rgb;
+        for l in 0..N {
+            let (input, out) = ([rgb[0][l], rgb[1][l], rgb[2][l]], [out[0][l], out[1][l], out[2][l]]);
+            let (before, after) = (luminance_2020(input), luminance_2020(out));
+            let untouched = (before <= 0.0) | (after <= 0.0) | !(out[0].is_finite() & out[1].is_finite() & out[2].is_finite());
+            let w = restore_weight(after / before);
+            for (c, restored) in restored.iter_mut().enumerate() {
+                let full = out[c] * before / after;
+                let blend = input[c] + (full - input[c]) * w;
+                // (`w >= 1` and `w <= 0` exclude each other)
+                restored[l] = if untouched | (w <= 0.0) {
+                    input[c]
+                } else if w >= 1.0 {
+                    full
+                } else {
+                    blend
+                };
+            }
+        }
+        restored
     }
 }
 
@@ -1016,6 +1115,230 @@ mod tests {
         let nan = hue_sat.apply([f32::NAN, 0.2, 0.1]);
         assert!(nan[0].is_nan() && nan[1] == 0.2 && nan[2] == 0.1);
         assert!(fit_hue_sat(&[], &Mat3::IDENTITY).is_none(), "too few samples");
+    }
+
+    #[test]
+    fn hue_sat_never_turns_near_black_noise_white() {
+        // a saturating table, as fitted to high-ISO Sony files; near-black noise with mixed-sign channels
+        let table = HsvTable { hue_divisions: 4, sat_divisions: 2, val_divisions: 1, data: vec![[10.0, 1.5, 1.0]; 8], srgb_value: false };
+        let hue_sat = HueSat::new(&table).unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        let mut worst = 0.0f32;
+        for _ in 0..200_000 {
+            let rgb = [0.002 + 0.004 * next(), 0.002 + 0.004 * next(), 0.002 + 0.004 * next()];
+            if luminance_2020(rgb) <= 0.0 {
+                continue;
+            }
+            let out = hue_sat.apply(rgb);
+            let scale = rgb.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            worst = worst.max(out.iter().fold(0.0f32, |m, v| m.max(v.abs())) / scale);
+        }
+        assert!(worst < 20.0, "a near-black pixel came out {worst}× its largest channel");
+    }
+
+    /// `apply_lanes` gives `apply`'s bits for any colour: random, near-black noise (the restore's blend), grey,
+    /// negative, tiny, above 1, huge, NaN and infinite components; on a fitted look's shape and a saturating table.
+    #[test]
+    fn hue_sat_lanes_match_one_by_one_bit_for_bit() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let unit = |r: u64, i: usize| ((r >> (16 * i)) & 0xffff) as f32 / 65535.0;
+        let fitted = (0..72 * 5 * 5)
+            .map(|_| {
+                let r = next();
+                [unit(r, 0) * 60.0 - 30.0, 0.5 + unit(r, 1), 1.0]
+            })
+            .collect();
+        let fitted = HsvTable { hue_divisions: 72, sat_divisions: 5, val_divisions: 5, data: fitted, srgb_value: true };
+        let saturating = HsvTable { hue_divisions: 4, sat_divisions: 2, val_divisions: 1, data: vec![[10.0, 1.5, 1.0]; 8], srgb_value: false };
+        let special = [0.0, -0.0, 1e-30, -1e-6, 0.002, 0.5, 1.0, 3.0, 1e30, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        let mut colours = Vec::new();
+        for a in special {
+            for b in special {
+                colours.extend(special.map(|c| [a, b, c]));
+            }
+        }
+        for _ in 0..60_000 {
+            let r = next();
+            let (offset, scale) = [(0.15, 1.3), (0.15e-3, 1.3e-3), (0.6, 5.0), (-0.002, 0.008)][(r >> 62) as usize];
+            colours.push(std::array::from_fn(|i| unit(r, i) * scale - offset));
+        }
+        for table in [fitted, saturating] {
+            let hue_sat = HueSat::new(&table).unwrap();
+            for chunk in colours.chunks(16) {
+                let rgb: [[f32; 16]; 3] = std::array::from_fn(|c| std::array::from_fn(|l| chunk.get(l).map_or(0.0, |p| p[c])));
+                let out = hue_sat.apply_lanes(rgb);
+                for (l, p) in chunk.iter().enumerate() {
+                    let (got, want) = ([out[0][l], out[1][l], out[2][l]], hue_sat.apply(*p));
+                    assert_eq!(got.map(f32::to_bits), want.map(f32::to_bits), "{p:?}: {got:?} vs {want:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hue_sat_restore_weight_blends_smoothly_between_the_thresholds() {
+        assert_eq!(restore_weight(0.0), 0.0);
+        assert_eq!(restore_weight(NO_LUMINANCE_KEPT), 0.0);
+        assert_eq!(restore_weight(MIN_LUMINANCE_KEPT), 1.0);
+        assert_eq!(restore_weight(1.0), 1.0);
+        assert_eq!(restore_weight(f32::NAN), 0.0);
+        // monotonic and without a step: neighbouring shares 0.001 apart differ by little
+        let mut last = 0.0f32;
+        for i in 0..=400 {
+            let w = restore_weight(i as f32 * 0.001);
+            assert!(w >= last && w - last < 0.02, "step at {}: {last} → {w}", i as f32 * 0.001);
+            last = w;
+        }
+    }
+
+    #[test]
+    fn hue_sat_keeps_colours_the_table_leaves_bright_exactly_as_before() {
+        // the blend only touches colours whose luminance the table cut below MIN_LUMINANCE_KEPT
+        let table = HsvTable { hue_divisions: 4, sat_divisions: 2, val_divisions: 1, data: vec![[10.0, 1.5, 1.0]; 8], srgb_value: false };
+        let hue_sat = HueSat::new(&table).unwrap();
+        let mul = |m: &[[f32; 3]; 3], v: [f32; 3]| -> [f32; 3] { std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2]) };
+        for rgb in [[0.4, 0.2, 0.1], [0.05, 0.3, 0.2], [0.18, 0.18, 0.18], [0.6, 0.1, 0.5]] {
+            let out = mul(&hue_sat.from, table.apply(mul(&hue_sat.to, rgb)));
+            let (before, after) = (luminance_2020(rgb), luminance_2020(out));
+            assert!(after >= MIN_LUMINANCE_KEPT * before);
+            assert_eq!(hue_sat.apply(rgb), out.map(|v| v * before / after));
+        }
+    }
+
+    fn raw_of(format: RawFormat, make: &str, model: &str, color: lightcraft_raw::ColorData) -> RawImage {
+        let area = lightcraft_raw::Rect::new(0, 0, 2, 2);
+        RawImage {
+            format,
+            width: 2,
+            height: 2,
+            cpp: 1,
+            data: lightcraft_raw::RawData::U16(vec![0; 4]),
+            cfa: None,
+            bits: 14,
+            black: Default::default(),
+            white: vec![16383.0],
+            active_area: area,
+            crop: area,
+            orientation: Default::default(),
+            color,
+            wb_multipliers: Some([2.0, 1.0, 1.5]),
+            linearized: false,
+            opcodes: Default::default(),
+            metadata: lightcraft_raw::Metadata { make: Some(make.to_owned()), model: Some(model.to_owned()), ..Default::default() },
+        }
+    }
+
+    /// Step 1: a file's own colour matrices win over everything, including a spectral row for its model; no JPEG fit
+    /// is tried.
+    #[test]
+    fn a_files_own_matrices_come_first() {
+        let own = Mat3([[0.6, -0.1, -0.05], [-0.4, 1.3, 0.1], [-0.1, 0.2, 0.7]]);
+        let color = lightcraft_raw::ColorData { illuminant: [21, 0], color_matrix: [Some(own), None], ..Default::default() };
+        let mut raw = raw_of(RawFormat::Cr2, "Canon", "Canon EOS 600D", color.clone());
+        let (_, t, look) = starting_colour_with(&mut raw, |_, _| panic!("no JPEG fit for a raw with its own matrices"));
+        assert_eq!(raw.color, color);
+        assert!(!t.matrix_is_fallback && look.is_none());
+    }
+
+    /// Steps 2 and 3 before step 4: an accepted JPEG fit (with or without a camera profile) is kept for a model that
+    /// has spectral matrices, and the spectral matrices are not written. Photos that had a fitted look before the
+    /// spectral table render exactly as they did.
+    #[test]
+    fn an_accepted_jpeg_fit_comes_before_the_spectral_matrices() {
+        for (make, model) in [("SONY", "ILCE-7M4"), ("Canon", "Canon EOS 600D")] {
+            assert!(lightcraft_raw::spectral::find(Some(make), model).is_some(), "{model}");
+            let mut raw = raw_of(RawFormat::Cr2, make, model, Default::default());
+            let fitted = CameraLook { matrix: Mat3::IDENTITY, tone: CameraTone::new(std::array::from_fn(|i| { let x = 0.006 * 1.13f32.powi(i as i32); [x, x.sqrt()] })).unwrap(), hue_sat: None };
+            let (xy, t, look) = starting_colour_with(&mut raw, |raw, t| {
+                assert!(t.matrix_is_fallback && !lightcraft_raw::color::has_matrix(&raw.color), "the fit sees the raw without spectral matrices");
+                Some(fitted.clone())
+            });
+            assert_eq!(look.map(|l| l.matrix), Some(fitted.matrix), "{model}");
+            assert_eq!(raw.color, lightcraft_raw::ColorData::default(), "{model}: spectral matrices left out");
+            assert!(t.matrix_is_fallback, "{model}");
+            assert_eq!(xy, lightcraft_raw::color::as_shot_white_xy(&raw));
+        }
+    }
+
+    /// Step 4: when the JPEG fit fails (here: no camera JPEG at all), a model with a spectral row takes its matrices,
+    /// whether or not it has a camera profile (the ILCE-7M4 has a bundled one).
+    #[test]
+    fn a_failed_jpeg_fit_falls_back_to_the_spectral_matrices() {
+        assert!(crate::camera_profiles::get("ILCE-7M4").is_some());
+        let camera = lightcraft_raw::spectral::find(Some("SONY"), "ILCE-7M4").unwrap();
+        let mut raw = raw_of(RawFormat::Arw, "SONY", "ILCE-7M4", Default::default());
+        let (_, t, look) = starting_colour(&mut raw, &[]);
+        assert!(look.is_none());
+        assert_eq!(raw.color.color_matrix, camera.color_matrix.map(Some));
+        assert!(!t.matrix_is_fallback);
+
+        let camera = lightcraft_raw::spectral::find(Some("Canon"), "Canon EOS 600D").unwrap();
+        let mut raw = raw_of(RawFormat::Cr2, "Canon", "Canon EOS 600D", Default::default());
+        let (xy, t, look) = starting_colour_with(&mut raw, |_, _| None);
+        assert!(look.is_none());
+        assert_eq!(raw.color.illuminant, [17, 21]);
+        assert_eq!(raw.color.forward_matrix, camera.forward_matrix.map(Some));
+        assert!(!t.matrix_is_fallback);
+        assert_eq!(xy, lightcraft_raw::color::as_shot_white_xy(&raw));
+        // white-balanced white stays white
+        let w = t.matrix.apply([1.0; 3]);
+        assert!(w.iter().all(|v| (v - 1.0).abs() < 1e-4), "{w:?}");
+    }
+
+    /// Step 5: a camera outside the table whose fit fails keeps the neutral fallback.
+    #[test]
+    fn a_camera_outside_the_table_keeps_the_fallback() {
+        let mut raw = raw_of(RawFormat::Cr2, "Canon", "Canon EOS 7D", Default::default());
+        let (_, t, look) = starting_colour(&mut raw, &[]);
+        assert!(look.is_none() && t.matrix_is_fallback);
+        assert_eq!(raw.color, lightcraft_raw::ColorData::default());
+        // without a model there is no table row
+        let mut raw = raw_of(RawFormat::Cr2, "Canon", "", Default::default());
+        raw.metadata.model = None;
+        assert!(starting_colour(&mut raw, &[]).1.matrix_is_fallback);
+    }
+
+    /// The colour precedence on public raws (each skipped without its corpus file): a photo whose JPEG fit is
+    /// accepted keeps it and its colour data; one whose fit fails takes its spectral matrices when its model has
+    /// them; a DNG keeps its own matrices. White balance stays relative to the as-shot look for every raw without
+    /// matrices of its own.
+    #[test]
+    fn corpus_colour_precedence() {
+        let dir = std::env::var_os("LIGHTCRAFT_CORPUS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus"))
+            .join("raw");
+        for name in ["arw-sony-a7m4-14bit.arw", "cr2-canon-5d3.cr2", "nef-nikon-d5100-lossless.nef", "cr2-canon-7d.cr2", "dng-canon-5d3-16bit.dng"] {
+            let Ok(bytes) = std::fs::read(dir.join(name)) else {
+                eprintln!("skip: {name} absent");
+                continue;
+            };
+            let mut raw = lightcraft_raw::decode(&bytes).unwrap();
+            raw.opcodes.list3.retain(|op| !op.is_lens_correction());
+            let own = lightcraft_raw::color::has_matrix(&raw.color);
+            let covered = raw.metadata.model.as_deref().and_then(|m| lightcraft_raw::spectral::find(raw.metadata.make.as_deref(), m)).is_some();
+            let before = raw.color.clone();
+            let (_, t, fitted) = starting_colour(&mut raw, &bytes);
+            let spectral = !own && fitted.is_none() && covered;
+            eprintln!("{name}: own matrices {own}, JPEG fit {}, spectral {spectral}", fitted.is_some());
+            assert_eq!(raw.color != before, spectral, "{name}");
+            assert_eq!(t.matrix_is_fallback, !own && !spectral, "{name}");
+            let (_, info) = crate::files::load_bytes(&bytes, 400).unwrap();
+            assert_eq!(info.camera_tone.is_some(), fitted.is_some(), "{name}");
+            assert_eq!(info.relative_wb, !own, "{name}");
+        }
     }
 
     #[test]

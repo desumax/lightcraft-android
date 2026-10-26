@@ -3,7 +3,7 @@
 use lightcraft_color::luminance_2020;
 use lightcraft_color::spline::{Lut1, MonotoneCurve};
 use lightcraft_color::transfer::linear_to_srgb;
-use lightcraft_develop::{DevelopSettings, LocalAdjustments, ToneCurve, VignetteStyle};
+use lightcraft_develop::{DevelopSettings, LocalAdjustments, Process, ToneCurve, VignetteStyle};
 use lightcraft_geom::Point;
 use lightcraft_raster::Rgba8;
 
@@ -233,13 +233,7 @@ impl FinishParams {
         FinishParams {
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
-            tone: if let Some(curve) = info.camera_tone.as_ref().filter(|_| info.raw) {
-                ToneMap::camera(curve, s.light.contrast, s.light.whites, s.light.blacks)
-            } else if info.raw {
-                ToneMap::new(s.light.contrast, s.light.whites, s.light.blacks)
-            } else {
-                ToneMap::display(s.light.contrast, s.light.whites, s.light.blacks)
-            },
+            tone: base_tone(s, info),
             lut: crate::lut::get(&s.profile.id).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
             ops: ColorOps::new(s),
             curves: curve_luts(&s.curve),
@@ -269,6 +263,22 @@ impl FinishParams {
             px_per_long,
             view: frame.view.map_or([0.0, 0.0, w as f32, h as f32], |v| [v.x as f32, v.y as f32, v.full_w as f32, v.full_h as f32]),
         }
+    }
+}
+
+/// The base tone map (scene → display luminance, with Contrast, Whites and Blacks) of `s`'s
+/// rendering process. This is where a new tone model branches: a retuned default tone curve (issue
+/// #146) is a new [`Process`] with its own arm here, and V1's arm stays as it is, so photos edited
+/// under V1 keep their look (`docs/process-versions.md`). CPU and GPU both take it from here.
+pub fn base_tone(s: &DevelopSettings, info: &SourceInfo) -> ToneMap {
+    let l = &s.light;
+    match s.process.process() {
+        // V2 changes the Highlights/Shadows base, not the tone map.
+        Process::V1 | Process::V2 => match info.camera_tone.as_ref().filter(|_| info.raw) {
+            Some(curve) => ToneMap::camera(curve, l.contrast, l.whites, l.blacks),
+            None if info.raw => ToneMap::new(l.contrast, l.whites, l.blacks),
+            None => ToneMap::display(l.contrast, l.whites, l.blacks),
+        },
     }
 }
 

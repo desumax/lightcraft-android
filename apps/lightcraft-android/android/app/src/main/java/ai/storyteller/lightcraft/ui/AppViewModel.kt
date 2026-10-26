@@ -3360,6 +3360,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun resetAll() = edit { it.execute("develop.reset", "{}") }
 
+    /** Keep the sliders and edits while opting into improved highlight/shadow detail; Undo restores the old look. */
+    fun updateProcessing() = edit(after = ::refreshToolState) { it.execute("develop.updateProcess", "{}") }
+
     /** The undo card's Reset Geometry: develop section [section] back to its defaults (one step). */
     fun resetSectionNamed(section: String) = edit { it.execute("develop.resetSection", JSONObject().put("section", section).toString()) }
 

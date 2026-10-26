@@ -388,6 +388,8 @@ pub struct Choice {
 /// The edited photo's settings the panel shows besides sliders.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct DevelopState {
+    /// Saved edits use an older rendering process; upgrading is an explicit, undoable action.
+    pub older_process: bool,
     /// Black & white (the B&W treatment or a monochrome profile), as the desktop's `is_bw`.
     pub black_and_white: bool,
     /// White balance mode id (`asShot`, `auto`, `daylight`… `custom`).
@@ -615,6 +617,7 @@ impl MobileSession {
         let p = s.catalog.photo(s.active()?)?;
         let d = &p.develop;
         Some(DevelopState {
+            older_process: d.process.is_outdated(),
             black_and_white: d.treatment == Treatment::Bw || d.profile.id == "lc.mono" || d.profile.id.starts_with("lc.bw."),
             wb_mode: enum_id(d.wb.mode),
             profile: d.profile.id.clone(),
@@ -998,9 +1001,22 @@ impl MobileSession {
     /// A grid thumbnail of photo `id` with its current look; the long edge is rounded up to 128,
     /// 256, 384 or 512 pixels. Comes from the thumbnail cache when it has one. Blocks.
     pub fn render_thumbnail(&self, id: u64, long_edge: u32) -> Result<RenderedImage, MobileError> {
-        let job = self.lock().thumb_job(PhotoId(id), long_edge as usize).ok_or(MobileError::NoPhoto(id))?;
+        let (job, quick) = {
+            let mut s = self.lock();
+            let job = s.thumb_job(PhotoId(id), long_edge as usize).ok_or(MobileError::NoPhoto(id))?;
+            let quick = s.quick_thumb_job(&job);
+            (job, quick)
+        };
         // grid decodes are background work: they wait while the editor's render needs the memory
-        let r = memory::in_background(|| job.run());
+        let r = memory::in_background(|| {
+            if let Some(quick) = quick {
+                let r = quick.run();
+                if r.rendered.is_ok() {
+                    return r;
+                }
+            }
+            job.run()
+        });
         self.lock().accept(&r);
         Ok(rendered_image(id, r.rendered.map_err(MobileError::Render)?, false))
     }
