@@ -48,6 +48,41 @@ fn camera_tone_and_relative_wb() {
     check("camera chroma curve edited", &src, &info, &s, &RenderRequest::fit(320, 240));
 }
 
+#[test]
+fn dehaze_edges_and_black_match_cpu() {
+    if !gpu() {
+        return;
+    }
+    let edge = Arc::new(Rgb32f::from_fn(240, 160, |x, _| if x < 120 { [0.02, 0.03, 0.012] } else { [0.45, 0.5, 0.55] }));
+    let black = Arc::new(Rgb32f::filled(240, 160, [0.0; 3]));
+    for (name, src, is_black) in [("dehaze dark edge", edge, false), ("dehaze black", black, true)] {
+        for exposure in [-2.0, 0.0, 2.0] {
+            for dehaze in [-80.0, 80.0] {
+                let mut s = DevelopSettings::default();
+                s.light.exposure = exposure;
+                s.effects.dehaze = dehaze;
+                let req = RenderRequest::fit(240, 160);
+                if !is_black {
+                    check(name, &src, &SourceInfo::default(), &s, &req);
+                    continue;
+                }
+                let cpu = render(&src, &SourceInfo::default(), &s, &req).image;
+                if let Some(gpu) = lightcraft_gpu::render(&src, &SourceInfo::default(), &s, &req, None) {
+                    let (mean, max, _) = diff(&cpu, &gpu.image);
+                    assert!(mean < MEAN_LSB && max <= MAX_LSB, "{name}: mean {mean}, max {max}");
+                } else {
+                    // Entirely black output deliberately falls back to the CPU: the engine
+                    // cannot distinguish it from GPU work that silently failed to run.
+                    let why = lightcraft_gpu::last_fallback().unwrap_or_default();
+                    assert!(why.contains("entirely black"), "unexpected fallback: {why}");
+                    assert!(cpu.data.iter().all(|p| p[..3] == [0, 0, 0]), "the reference is not black");
+                    assert!(lightcraft_gpu::available(), "a black image must not disable the GPU");
+                }
+            }
+        }
+    }
+}
+
 fn scene(i: usize, w: usize, h: usize) -> Arc<Rgb32f> {
     Arc::new(lightcraft_scenes::demo_library()[i].render(w, h))
 }
