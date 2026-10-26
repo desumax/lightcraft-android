@@ -33,7 +33,7 @@ use crate::media::ProbeInfo;
 /// File extensions LightCraft imports (lower case).
 pub const EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "tif", "tiff", "webp", "dng", "cr2", "cr3", "nef", "nrw", "arw", "raf", "orf", "rw2", "rwl", "raw", "pef", "psd", "jxl",
-    "gif", "bmp", "heic", "avif", // containers LightCraft cannot decode but imports as preview only (their embedded JPEG)
+    "gif", "bmp", "heic", "heif", "avif", // containers LightCraft cannot decode but imports as preview only (their embedded JPEG)
     "iiq", "crw", "mrw", "x3f", "kdc", "mos", "erf",
 ];
 

@@ -62,7 +62,7 @@ impl SettingsHashes {
 }
 
 /// Bump when the pipeline's output changes, to invalidate cached thumbnails.
-pub const RENDER_CACHE_VERSION: u64 = 17;
+pub const RENDER_CACHE_VERSION: u64 = 18;
 
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
@@ -121,6 +121,11 @@ fn source_edge_needed(p: &Photo, settings: &DevelopSettings, apply_crop: bool, o
 /// Decodes a file into a linear Rec.2020 image no larger than `max_edge` (set by the app).
 pub type FileLoader = Arc<dyn Fn(&str, usize) -> Result<(Rgb32f, SourceInfo), String> + Send + Sync>;
 
+/// [`FileLoader`] for a thumbnail: a raw file that keeps smaller copies of its raw image (Lightroom's merged DNGs)
+/// develops the smallest that covers `max_edge` (set by the app); the flag says it did. Never used for an export,
+/// which must render the full image.
+pub type ReducedLoader = Arc<dyn Fn(&str, usize) -> Result<(Rgb32f, SourceInfo, bool), String> + Send + Sync>;
+
 /// A raw file's embedded (camera-rendered) preview as display sRGB, oriented, no larger than
 /// `max_edge` (set by the app). `None`: no usable preview.
 pub type PreviewLoader = Arc<dyn Fn(&str, usize) -> Option<Rgba8> + Send + Sync>;
@@ -172,11 +177,17 @@ pub struct DecodedSource {
     pub camera_tone: Option<lightcraft_pipeline::tone::CameraTone>,
     /// The same picture developed from the AI-denoised mosaic, when the photo has one cached.
     pub denoised: Option<Arc<Twin>>,
+    /// These pixels came from the photo's smart preview (an offline original), not from its file.
+    /// A refresh must never rebuild a proxy from itself: that would stamp its older look as current.
+    pub from_proxy: bool,
+    /// Developed from a smaller copy of the raw image that the file keeps ([`ReducedLoader`]), not from the image
+    /// itself: good for a thumbnail, never for an export.
+    pub reduced: bool,
 }
 
 impl DecodedSource {
     pub fn new(image: Arc<Rgb32f>, info: Option<SourceInfo>) -> Self {
-        DecodedSource { image, info, camera_tone: None, denoised: None }
+        DecodedSource { image, info, camera_tone: None, denoised: None, from_proxy: false, reduced: false }
     }
 
     /// The picture to develop for a Denoise `amount` (0 to 1, see [`DevelopSettings::denoise_amount`]): the plain one,
@@ -213,9 +224,13 @@ impl DecodedSource {
     }
 
     /// What to render these pixels against: the decoder's facts, else `header` (the catalog's)
-    /// with any stored camera tone curve.
+    /// with any stored camera tone curve. The original's size comes from `header` either way: the
+    /// decoder only sees the level it decoded.
     pub fn info_or(&self, header: SourceInfo) -> SourceInfo {
-        self.info.clone().unwrap_or_else(|| SourceInfo { camera_tone: self.camera_tone.or(header.camera_tone), ..header })
+        match &self.info {
+            Some(info) => SourceInfo { native_long: info.native_long.or(header.native_long), ..info.clone() },
+            None => SourceInfo { camera_tone: self.camera_tone.or(header.camera_tone), ..header },
+        }
     }
 }
 
@@ -235,6 +250,8 @@ pub enum SourceRef {
         fallback: Option<std::path::PathBuf>,
         /// The photo has a cached denoised picture: load it with the plain one (see [`PairLoader`]).
         denoise: Option<(DenoiseSpec, PairLoader)>,
+        /// A thumbnail's loader, used instead of `loader` (see [`ReducedLoader`]); `None` for every other job.
+        reduced: Option<ReducedLoader>,
     },
     /// A smart preview standing in for a missing original.
     Smart {
@@ -251,10 +268,13 @@ impl SourceRef {
         let image = match self {
             SourceRef::Loaded(a) => return Ok((**a).clone()),
             SourceRef::Demo { scene, max_edge } => crate::demo::scene_pixels(scene, *max_edge),
-            SourceRef::File { path, max_edge, loader, fallback, denoise } => {
-                let plain = || match loader {
-                    Some(l) => l(path, *max_edge).map(|(image, info)| DecodedSource::new(Arc::new(image), Some(info))),
-                    None => Err(format!("no decoder available for {path}")),
+            SourceRef::File { path, max_edge, loader, fallback, denoise, reduced } => {
+                let plain = || match (reduced, loader) {
+                    (Some(l), _) => {
+                        l(path, *max_edge).map(|(image, info, reduced)| DecodedSource { reduced, ..DecodedSource::new(Arc::new(image), Some(info)) })
+                    }
+                    (None, Some(l)) => l(path, *max_edge).map(|(image, info)| DecodedSource::new(Arc::new(image), Some(info))),
+                    (None, None) => Err(format!("no decoder available for {path}")),
                 };
                 // the denoised picture comes with the plain one from a single decode; when it cannot be read the
                 // pair loader gives the plain picture alone (the cached file is never a reason to fail a render)
@@ -276,6 +296,8 @@ impl SourceRef {
                                     info: Some(info),
                                     camera_tone: None,
                                     denoised: twin.map(|t| Arc::new(Twin::new(Arc::new(t)))),
+                                    from_proxy: false,
+                                    reduced: false,
                                 })
                             })
                         } else {
@@ -316,6 +338,8 @@ pub struct MediaCache {
     /// share of [`crate::memory::budget`]); the least recently used entry of any of them goes first.
     budget: usize,
     pub file_loader: Option<FileLoader>,
+    /// What grid thumbnails load files with (see [`ReducedLoader`]); `None`: [`Self::file_loader`].
+    pub reduced_loader: Option<ReducedLoader>,
     pub file_probe: Option<FileProbe>,
     pub preview_loader: Option<PreviewLoader>,
     /// Reads a photo file's bytes (Photo Merge); `None` = the local file system.
@@ -389,6 +413,7 @@ impl Default for MediaCache {
             preview_capacity: 0,
             budget,
             file_loader: None,
+            reduced_loader: None,
             file_probe: None,
             preview_loader: None,
             file_bytes: None,
@@ -637,11 +662,11 @@ impl MediaCache {
                 }
                 match self.scenes.iter().find(|s| s.id == *scene) {
                     Some(s) => SourceRef::Demo { scene: Box::new(s.clone()), max_edge },
-                    None => SourceRef::File { path: format!("demo:{scene}"), max_edge, loader: None, fallback: None, denoise: None },
+                    None => SourceRef::File { path: format!("demo:{scene}"), max_edge, loader: None, fallback: None, denoise: None, reduced: None },
                 }
             }
             Source::File { path } => {
-                SourceRef::File { path: path.clone(), max_edge, loader: self.file_loader.clone(), fallback: None, denoise: None }
+                SourceRef::File { path: path.clone(), max_edge, loader: self.file_loader.clone(), fallback: None, denoise: None, reduced: None }
             }
         }
     }
@@ -886,9 +911,16 @@ pub fn content_key(p: &Photo) -> String {
 
 pub fn source_info(p: &Photo) -> SourceInfo {
     // Procedural demo scenes are scene-referred HDR (like raw files): use the filmic tone map.
+    // (They are drawn afresh at every size, so they have no original size.)
     if matches!(p.source, Source::Demo { .. }) {
         return SourceInfo { raw: true, ..Default::default() };
     }
+    // the thumbnail and preview levels are smaller copies: noise reduction works in the original's pixels (#960)
+    let native_long = Some(p.width.max(p.height) as usize).filter(|&n| n > 0);
+    SourceInfo { native_long, ..header_info(p) }
+}
+
+fn header_info(p: &Photo) -> SourceInfo {
     // A raw shown from its embedded preview is a rendered (display-referred) JPEG: relative white
     // balance and the display tone curve, like any other rendered file.
     if p.develops_raw() {
@@ -909,7 +941,12 @@ impl crate::Session {
     /// (≥ `long_edge`) and the result comes from / goes to the thumbnail cache (memory + disk).
     pub fn thumb_job(&mut self, id: PhotoId, long_edge: usize) -> Option<RenderJob> {
         let b = thumb_bucket(long_edge);
-        self.build_job(id, b, b, false, true, Some(b))
+        let mut job = self.build_job(id, b, b, false, true, Some(b))?;
+        // (a thumbnail may develop a smaller copy of the raw image that the file keeps)
+        if let SourceRef::File { reduced, .. } = &mut job.source {
+            reduced.clone_from(&self.media.reduced_loader);
+        }
+        Some(job)
     }
 
     fn build_job(
@@ -1166,6 +1203,23 @@ impl crate::Session {
         }
     }
 
+    /// Whether `p`'s thumbnail can be the camera's own JPEG, so a frontend can skip the sensor
+    /// decode behind it.
+    ///
+    /// The grid shows this JPEG first in any case ([`QuickJob`]: "grid thumbnails of unedited raws
+    /// likewise start from the embedded preview"), and then paid for a render of the raw to replace
+    /// it. That render decodes the whole sensor — 50 of a 56 MB Fuji RAF's bytes — for a 512 px
+    /// thumbnail the 4 416 × 2 944 embedded JPEG already covers, and on a share at 1.2 MB/s it is
+    /// 45 s a photo: a 149-photo folder spent 8.3 GB of traffic on thumbnails, and the queue behind
+    /// it delayed the render the user was waiting for.
+    ///
+    /// Only unedited raws answer `true`: any edit must be rendered, and `has_import_look` is what
+    /// says the photo still looks the way it did at import. A photo the user edits re-renders
+    /// through the ordinary path, because its thumbnail key (settings hash) changes.
+    pub fn embedded_thumb_is_final(&self, p: &Photo) -> bool {
+        self.embedded_of(p).is_some()
+    }
+
     /// The camera's embedded preview of a raw file, for the face scan. Faces are read from the unedited picture, so the
     /// photo's edits do not matter, and the camera's own JPEG (oriented, display-ready) costs a fraction of decoding the
     /// raw. `None` for anything else, and where the host installed no loader.
@@ -1250,6 +1304,16 @@ impl crate::Session {
         depth: lightcraft_pipeline::OutputDepth,
     ) -> Result<RenderJob, String> {
         let mut job = self.render_job(id, max_w, max_h, false, true).ok_or("no such photo")?;
+        // An export renders the full image: never a thumbnail's source developed from a smaller copy of the raw
+        // image that the file keeps (Lightroom's merged DNGs)
+        let reduced = match &job.source {
+            SourceRef::Loaded(s) => s.reduced,
+            _ => false,
+        };
+        if reduced {
+            let p = self.catalog.photo(id).ok_or("no such photo")?.clone();
+            job.source = self.media.source_ref_uncached(&p, job.level);
+        }
         // An export is made from the denoised picture its Denoise amount asks for, made when the job runs if the
         // background queue has not got to it. (A source kept in memory may lack the picture, so the job reads the file.)
         if let Some(wanted) = self.denoise_for_export(id, &job.settings)? {
@@ -1407,6 +1471,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn renders_know_the_original_size_whichever_level_they_come_from() {
+        // issue #960: noise reduction works in the original's pixels, so a grid cell drawn from the
+        // 512-px thumbnail level denoises like a scaled-down export
+        let p = Photo::new(PhotoId(1), Source::File { path: "/photos/a.ARW".into() }, "a.ARW", "ARW", 6000, 4000, "");
+        assert_eq!(source_info(&p).native_long, Some(6000));
+        let decoded = SourceInfo { raw: true, as_shot_temp: 4800.0, ..Default::default() };
+        let thumb = DecodedSource::new(Arc::new(Rgb32f::new(8, 8)), Some(decoded.clone()));
+        let info = thumb.info_or(source_info(&p));
+        assert_eq!(info, SourceInfo { native_long: Some(6000), ..decoded }, "the decoder's facts, the catalog's size");
+        let unknown = Photo::new(PhotoId(2), Source::File { path: "/photos/b.jpg".into() }, "b.jpg", "JPEG", 0, 0, "");
+        assert_eq!(source_info(&unknown).native_long, None);
+        assert_eq!(source_info(&Photo::new(PhotoId(3), Source::Demo { scene: 0 }, "d", "ARW", 600, 400, "")).native_long, None);
+    }
+
+    #[test]
     fn denoise_mix_is_reserved_before_the_source_enters_the_cache() {
         let mut plain = Rgb32f::new(8, 8);
         plain.data.fill([1.0; 3]);
@@ -1442,6 +1521,7 @@ mod tests {
             })),
             fallback: None,
             denoise: None,
+            reduced: None,
         };
         job.info = SourceInfo::default(); // Header facts cannot override decoder facts.
         job.settings = Arc::new(DevelopSettings::default());

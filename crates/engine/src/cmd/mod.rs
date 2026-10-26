@@ -55,6 +55,10 @@ pub struct CommandSpec {
     pub run: Run,
     /// Record in the journal (false for queries).
     pub journal: bool,
+    /// `enabled` judges the selection (menus, shortcuts); a call that names its photos (`ids` /
+    /// `id`, see [`names_photos`]) skips it, and the command validates those photos itself.
+    /// Off unless a command opts in (`CommandSpec { explicit_targets: true, ..cmd!(…) }`).
+    pub explicit_targets: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -108,10 +112,10 @@ pub fn has_clipboard(s: &Session) -> std::result::Result<(), String> {
 
 macro_rules! cmd {
     ($id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr, $run:expr) => {
-        $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: true }
+        $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: true, explicit_targets: false }
     };
     (query $id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr, $run:expr) => {
-        $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: false }
+        $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: false, explicit_targets: false }
     };
 }
 pub(crate) use cmd;
@@ -158,6 +162,11 @@ pub fn find_command(id: &str) -> Option<&'static CommandSpec> {
 }
 
 // ---------- param helpers
+
+/// The call names its target photos (`ids` or `id`, not null) instead of using the selection.
+pub(crate) fn names_photos(p: &Value) -> bool {
+    ["ids", "id"].iter().any(|k| p.get(k).is_some_and(|v| !v.is_null()))
+}
 
 pub(crate) fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: cmd.into(), msg: msg.into() }

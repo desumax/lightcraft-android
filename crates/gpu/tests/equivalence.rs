@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use lightcraft_develop::{BrushStroke, DevelopSettings, Mask, MaskComponent, MaskOp, MaskShape, Spot, Treatment, VignetteStyle, WbMode, Wheel};
+use lightcraft_develop::{
+    BrushStroke, DevelopSettings, Mask, MaskComponent, MaskOp, MaskShape, Process, Spot, Treatment, VignetteStyle, WbMode, Wheel,
+};
 use lightcraft_geom::{Orientation, Point, Rect};
 use lightcraft_pipeline::{Quality, RenderRequest, SourceInfo, StageCache, render};
 use lightcraft_raster::{Rgb32f, Rgba8};
@@ -124,6 +126,26 @@ fn typical(s: &mut DevelopSettings) {
     s.detail.nr_luminance = 30.0;
     s.detail.nr_color = 25.0;
     s.detail.sharpen_amount = 40.0;
+}
+
+/// Issue #960: a preview's noise reduction works in the original's pixels (a smaller radius, a
+/// smaller `eps`, faded below one pixel). The GPU takes the same parameters (`local::nr_params`).
+#[test]
+fn preview_noise_reduction_matches() {
+    if !gpu() {
+        return;
+    }
+    let src = scene(3, 640, 480);
+    let mut s = DevelopSettings::default();
+    s.detail.nr_luminance = 70.0;
+    s.detail.nr_detail = 30.0;
+    s.detail.nr_color = 60.0;
+    s.detail.nr_color_smoothness = 50.0;
+    // a preview level of a 6000-px original: loupe-, grid- and tiny-thumbnail-sized outputs
+    let info = SourceInfo { raw: true, native_long: Some(6000), ..Default::default() };
+    for (name, edge) in [("NR preview 640 of 6000", 640), ("NR preview 320 of 6000", 320), ("NR preview 128 of 6000", 128)] {
+        check(name, &src, &info, &s, &RenderRequest::fit(edge, edge));
+    }
 }
 
 /// A render big enough for the per-pixel stage to run in several bands of rows (and the render
@@ -580,6 +602,7 @@ fn embedded_lens_perspective_edges_match() {
             radius: 0.6,
         }),
         vignette: Some(EmbeddedVignette { k: [0.4, -0.1, 0.02, 0.0, 0.0], center: Point::new(0.5, 0.5), radius: 0.6 }),
+        stages: Default::default(),
     };
     let info = SourceInfo { lens: Some(lens), ..raw };
     let mut s = DevelopSettings::default();
@@ -610,6 +633,49 @@ fn cached_renders_match_uncached() {
         let warm = lightcraft_gpu::render(&src, &info, &s, &req, Some(&cache)).expect("gpu");
         let fresh = lightcraft_gpu::render(&src, &info, &s, &req, None).expect("gpu");
         assert_eq!(warm.image, fresh.image, "step {k}");
+    }
+}
+
+/// Issue #632: the Highlights / Shadows base of each process (V1: the edge-aware filter of log
+/// luminance; V2: of its fine median, a radius that grows with the render) matches the CPU's, and
+/// a warm cache never hands one process the other's base.
+#[test]
+fn highlights_shadows_base_matches_on_every_process() {
+    if !gpu() {
+        return;
+    }
+    let raw = SourceInfo { raw: true, ..Default::default() };
+    let src = scene(0, 2400, 1600);
+    let cache = StageCache::default();
+    for &(w, h) in &[(720, 480), (2400, 1600)] {
+        let req = RenderRequest::fit(w, h);
+        for p in Process::ALL {
+            let mut s = DevelopSettings { process: p.version(), ..DevelopSettings::default() };
+            s.light.highlights = -100.0;
+            s.light.shadows = 60.0;
+            check(&format!("{p:?} highlights/shadows {w}"), &src, &raw, &s, &req);
+            typical(&mut s);
+            check(&format!("{p:?} typical {w}"), &src, &raw, &s, &req);
+            s.masks = vec![Mask {
+                components: vec![MaskComponent {
+                    hidden: false,
+                    name: None,
+                    op: MaskOp::Add,
+                    invert: false,
+                    shape: MaskShape::Linear { start: Point::new(0.5, 0.0), end: Point::new(0.5, 0.9) },
+                }],
+                adjust: lightcraft_develop::LocalAdjustments { highlights: -70.0, shadows: 40.0, ..Default::default() },
+                ..Default::default()
+            }];
+            check(&format!("{p:?} local highlights {w}"), &src, &raw, &s, &req);
+        }
+        for p in [Process::V1, Process::V2, Process::V1, Process::V2] {
+            let mut s = DevelopSettings { process: p.version(), ..DevelopSettings::default() };
+            s.light.highlights = -100.0;
+            let warm = lightcraft_gpu::render(&src, &raw, &s, &req, Some(&cache)).expect("gpu");
+            let fresh = lightcraft_gpu::render(&src, &raw, &s, &req, None).expect("gpu");
+            assert_eq!(warm.image, fresh.image, "{p:?} at {w} px, cached");
+        }
     }
 }
 

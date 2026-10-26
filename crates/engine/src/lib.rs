@@ -357,7 +357,10 @@ impl Session {
     /// Run a command by id. THE entry point for every frontend.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
-        (spec.enabled)(self).map_err(|why| EngineError::Disabled(id.to_string(), why))?;
+        // a command that validates the photos a call names isn't held back by the selection
+        if !(spec.explicit_targets && cmd::names_photos(params)) {
+            (spec.enabled)(self).map_err(|why| EngineError::Disabled(id.to_string(), why))?;
+        }
         let empty = Value::Object(Default::default());
         let params = if params.is_null() { &empty } else { params };
         self.run_command(id, spec.journal.then_some(params), |s| (spec.run)(s, params))
@@ -632,7 +635,8 @@ impl Session {
 
     /// With Auto Sync on, the ops that carry an edit of the active photo `id` (to `new`) over to the
     /// other selected photos: only the settings that changed; never spot removal or red eye (they
-    /// belong to one photo's pixels), nor history / snapshot restores.
+    /// belong to one photo's pixels), nor the rendering process (Sync doesn't carry it either), nor
+    /// history / snapshot restores.
     fn auto_sync_ops(&self, id: PhotoId, new: &DevelopSettings, label: &str) -> Vec<Op> {
         if !self.auto_sync
             || self.active() != Some(id)
@@ -645,7 +649,7 @@ impl Session {
         let Some(old) = self.develop_of(id) else { return Vec::new() };
         let Some(mut delta) = json_delta(&old.to_json(), &new.to_json()) else { return Vec::new() };
         if let Some(o) = delta.as_object_mut() {
-            for k in ["spots", "red_eye", "version"] {
+            for k in ["spots", "red_eye", "version", "process"] {
                 o.remove(k);
             }
             if o.is_empty() {
@@ -876,6 +880,8 @@ mod tests_organize;
 mod tests_persist;
 #[cfg(test)]
 mod tests_prefs;
+#[cfg(test)]
+mod tests_process;
 #[cfg(test)]
 mod tests_segment;
 #[cfg(test)]

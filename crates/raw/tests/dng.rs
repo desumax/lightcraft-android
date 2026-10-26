@@ -379,6 +379,43 @@ fn floating_point_dngs() {
 }
 
 #[test]
+fn non_finite_float_samples_decode_and_develop() {
+    // regression: NaN samples in a float CFA DNG panicked AHD and PPG (`f32::clamp` with NaN bounds)
+    let (w, h) = (24, 20);
+    let mut raw = synthetic(w, h, Some(Cfa::bayer("RGGB").unwrap()), 1);
+    let mut vals: Vec<f32> = (0..w * h).map(|i| ((i * 37) % 200) as f32 / 256.0).collect();
+    for (i, v) in vals.iter_mut().enumerate() {
+        let (x, y) = (i % w, i / w);
+        if (8..14).contains(&x) && (6..12).contains(&y) {
+            *v = f32::NAN;
+        } else if i % 11 == 0 {
+            *v = if i % 2 == 0 { f32::INFINITY } else { f32::NEG_INFINITY };
+        }
+    }
+    raw.data = RawData::F32(vals.clone());
+    raw.black = BlackLevel::uniform(0.0);
+    raw.white = vec![0.75];
+    for compression in [DngCompression::Uncompressed, DngCompression::Deflate { tile: 16, half: false }] {
+        let bytes = write_dng(&raw, &DngWriteOptions { compression, ..Default::default() }).unwrap();
+        let img = decode(&bytes).unwrap();
+        // NaN and −∞ read as black, +∞ as the white level; finite samples are kept bit-exactly
+        let RawData::F32(got) = &img.data else { panic!("float data expected") };
+        for (a, b) in vals.iter().zip(got) {
+            let want = match *a {
+                f32::INFINITY => 0.75,
+                v if v.is_finite() => v,
+                _ => 0.0,
+            };
+            assert_eq!(want.to_bits(), b.to_bits(), "{a} read as {b}");
+        }
+        for m in [Method::Bilinear, Method::Ppg, Method::Ahd] {
+            let rgb = img.develop(m).unwrap();
+            assert!(rgb.data.iter().all(|p| p.iter().all(|v| v.is_finite())), "{m:?}");
+        }
+    }
+}
+
+#[test]
 fn lj92_strips_and_levels_and_linearization() {
     let (w, h) = (20, 12);
     let px = pattern(w, h, 1, 12);

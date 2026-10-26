@@ -3,6 +3,10 @@
 //! A preset is a *partial* settings object (JSON) — only the groups it includes. Applying merges it
 //! into the photo's settings; `amount` (0..200 %) interpolates numeric values between the current
 //! settings and the preset's. Copy/paste/sync use the same group selection ([`SettingsGroup`]).
+//!
+//! The rendering process ([`crate::ProcessVersion`]) is in no group: copy, paste, sync and presets
+//! made from a photo never carry it, so the photos they change keep their own. A partial that names
+//! `process` itself (Apply Settings JSON) sets it like any other field.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
