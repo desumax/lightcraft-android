@@ -1,0 +1,43 @@
+name: Android pull request build
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  android:
+    name: ARM64 debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Rust toolchain and targets
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-pr
+      - name: Install cargo-ndk and Android NDK
+        run: |
+          cargo install cargo-ndk --version 4.1.2 --locked
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.14206865" >/dev/null
+      - name: Build ARM64 debug APK
+        working-directory: apps/lightcraft-android/android
+        run: ./gradlew assembleDebug -Plightcraft.abis=arm64-v8a --no-daemon
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lightcraft-arm64-debug
+          path: apps/lightcraft-android/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
