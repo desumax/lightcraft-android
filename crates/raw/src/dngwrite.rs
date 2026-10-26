@@ -25,6 +25,10 @@ pub enum DngCompression {
     },
 }
 
+/// Faster lossless Deflate for DNG tiles: level 1 trades slightly larger files for shorter saves.
+/// Applies to float and integer tiles; lossless-JPEG and uncompressed output are unchanged.
+const DEFLATE_LEVEL: u8 = 1;
+
 /// IEEE 754 binary32 → binary16 (round to nearest even; overflow → ±inf, NaN kept).
 pub fn f32_to_f16(v: f32) -> u16 {
     let b = v.to_bits();
@@ -259,7 +263,7 @@ pub fn write_dng(raw: &RawImage, opts: &DngWriteOptions) -> Result<Vec<u8>> {
                         }
                         buf.extend_from_slice(&float_predict(&row, tile * cpp, bp, cpp));
                     }
-                    miniz_oxide::deflate::compress_to_vec_zlib(&buf, 6)
+                    miniz_oxide::deflate::compress_to_vec_zlib(&buf, DEFLATE_LEVEL)
                 })
                 .collect();
             ifd.set_image(ImageData::Tiles { tile_width: tile as u32, tile_height: tile as u32, tiles });
@@ -322,7 +326,7 @@ pub fn write_dng(raw: &RawImage, opts: &DngWriteOptions) -> Result<Vec<u8>> {
                                 }
                                 row.iter().for_each(|&x| opts.order.put_u16(&mut buf, x));
                             }
-                            miniz_oxide::deflate::compress_to_vec_zlib(&buf, 6)
+                            miniz_oxide::deflate::compress_to_vec_zlib(&buf, DEFLATE_LEVEL)
                         })
                         .collect();
                     ifd.set_image(ImageData::Tiles { tile_width: tile as u32, tile_height: tile as u32, tiles });
